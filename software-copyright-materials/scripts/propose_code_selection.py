@@ -7,8 +7,22 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from common import CODE_MAX_COLUMNS, FRONTEND_EXTS, ensure_dir, iter_source_files, rel, write_json
-from extract_code_material import LINES_PER_PAGE, SPLIT_THRESHOLD_PAGES, category_weight, material_code_lines
+from common import (
+    CODE_MAX_COLUMNS,
+    CODE_MIN_LINES_PER_PAGE,
+    FRONTEND_EXTS,
+    ensure_dir,
+    iter_source_files,
+    rel,
+    write_json,
+)
+from extract_code_material import (
+    LINES_PER_PAGE,
+    SPLIT_THRESHOLD_PAGES,
+    category_weight,
+    material_code_lines,
+    selected_line_estimate,
+)
 
 
 DEFAULT_MAX_FILES = 0
@@ -65,11 +79,6 @@ def build_candidates(project: Path) -> list[dict[str, Any]]:
     return candidates
 
 
-def selected_line_estimate(item: dict[str, Any]) -> int:
-    total = int(item.get("material_line_count") or item.get("line_count") or 0)
-    return total + 1 if total > 0 else 0
-
-
 def selection_stats(candidates: list[dict[str, Any]]) -> dict[str, int]:
     selected_items = [item for item in candidates if item.get("selected")]
     return {
@@ -121,13 +130,15 @@ def write_selection_md(path: Path, data: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """生成候选清单并按正式代码页的行数范围估算页数。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--analysis", help="Optional project analysis JSON; retained for workflow traceability")
     parser.add_argument("--out-dir", default="软件著作权申请资料/草稿")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES, help="Only limits candidate inventory size; does not auto-select files")
     parser.add_argument("--target-pages", type=int, default=SPLIT_THRESHOLD_PAGES)
-    parser.add_argument("--lines-per-page", type=int, default=LINES_PER_PAGE)
+    parser.add_argument("--lines-per-page", type=int, default=LINES_PER_PAGE,
+                        choices=range(CODE_MIN_LINES_PER_PAGE, LINES_PER_PAGE + 1))
     args = parser.parse_args()
 
     project = Path(args.project)

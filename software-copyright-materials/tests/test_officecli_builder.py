@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -11,7 +14,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 from build_docx_from_md import (  # noqa: E402
     THEME_FONT_TARGETS,
+    build_all,
+    build_manual_docx,
     code_paragraph_commands,
+    document_commands,
     header_commands,
     manual_format_commands,
     normalize_docx_theme_fonts,
@@ -20,6 +26,7 @@ from build_docx_from_md import (  # noqa: E402
     prepare_manual_markdown,
     screenshot_paths_from_manifest,
     theme_font_slots,
+    validate_code_pages,
 )
 from common import (  # noqa: E402
     CODE_FONT_NAME,
@@ -28,6 +35,7 @@ from common import (  # noqa: E402
     CODE_LINES_PER_PAGE,
     CODE_MAX_COLUMNS,
 )
+from extract_code_material import write_pages_md  # noqa: E402
 from officecli_backend import officecli_environment  # noqa: E402
 
 
@@ -49,10 +57,22 @@ class OfficeCliBuilderTests(unittest.TestCase):
         fields = [command for command in commands if command.get("type") == "field"]
         self.assertEqual(fields[0]["props"]["fieldType"], "page")
 
-    def test_code_paragraphs_do_not_force_page_breaks(self) -> None:
+    def test_document_commands_add_footer_and_set_start_page(self) -> None:
+        """源程序后半部分从 31 编号，文档从 1 编号，两者均具备页脚。"""
+        for code_mode, start, label in [(True, 31, "源程序鉴别材料"), (False, 1, "文档鉴别材料")]:
+            commands = document_commands("示例软件", "1.0", code_mode=code_mode, page_start=start)
+            section = next(command for command in commands if command.get("path") == "/section[1]")
+            self.assertEqual(section["props"]["pageStart"], str(start))
+            footer = next(command for command in commands if command.get("type") == "footer")
+            self.assertEqual(footer["props"]["text"], label)
+            self.assertEqual(footer["props"]["type"], "default")
+
+    def test_code_paragraphs_break_only_at_draft_page_boundaries(self) -> None:
+        """每个新页只在首行换页，首个源码段落不额外产生空页。"""
         commands = code_paragraph_commands([(1, ["a", "b"]), (2, ["c", "d"])])
         self.assertEqual([command["props"]["text"] for command in commands], ["a", "b", "c", "d"])
-        self.assertTrue(all("pageBreakBefore" not in command["props"] for command in commands))
+        self.assertEqual([command["props"].get("pageBreakBefore") for command in commands],
+                         [None, None, "true", None])
         self.assertTrue(all("keepLines" not in command["props"] for command in commands))
         self.assertTrue(all(command["props"]["font"] == CODE_FONT_NAME for command in commands))
         self.assertTrue(all(command["props"]["size"] == CODE_FONT_SIZE for command in commands))
@@ -64,6 +84,67 @@ class OfficeCliBuilderTests(unittest.TestCase):
         path = self.temp_dir / "code.md"
         path.write_text("## 第 31 页\n\n```text\na\nb\n```\n", encoding="utf-8")
         self.assertEqual(parse_code_pages(path), [(31, ["a", "b"])])
+
+    def test_code_draft_round_trip_preserves_markdown_like_source(self) -> None:
+        """源码中的反引号和类似页标题的注释必须原样保留。"""
+        path = self.temp_dir / "code.md"
+        pages = [(1, ["const example = `", "```js", "## 第 19 页", "call();", "````", "`;"])]
+        write_pages_md(path, "示例", "示例软件", "V1.0", pages)
+        self.assertEqual(parse_code_pages(path), pages)
+
+    def test_code_pages_reject_insufficient_source_lines_and_bad_numbering(self) -> None:
+        """空行不能补足普通源码页的 50 行。"""
+        full_page = ["pass"] * 50
+        validate_code_pages([(1, full_page), (2, ["pass"])], "代码-全部.md")
+        for lines in [full_page[:-1], full_page[:-1] + [" "], ["pass"] * 56]:
+            with self.assertRaisesRegex(ValueError, "第 1 页"):
+                validate_code_pages([(1, lines), (2, ["pass"])], "代码-全部.md")
+        with self.assertRaisesRegex(ValueError, "页码不连续"):
+            validate_code_pages([(1, full_page), (3, ["pass"])], "代码-全部.md")
+        with self.assertRaisesRegex(ValueError, "第 30 页"):
+            validate_code_pages(
+                [(number, full_page if number < 30 else ["pass"]) for number in range(1, 31)],
+                "代码-前30页.md",
+            )
+
+    def test_invalid_second_draft_keeps_existing_materials(self) -> None:
+        """后半部分未通过分页校验时，保留上一批正式材料。"""
+        with TemporaryDirectory(dir=self.temp_dir) as folder:
+            workdir = Path(folder)
+            draft = workdir / "草稿"
+            final = workdir / "正式资料"
+            draft.mkdir()
+            final.mkdir()
+            old = final / "申请表信息.txt"
+            old.write_text("上一批", encoding="utf-8")
+            names = ["代码-前30页.md", "代码-后30页.md"]
+            (draft / "代码提取清单.json").write_text(json.dumps({"outputs": names}), encoding="utf-8")
+            write_pages_md(draft / names[0], "前半", "示例软件", "V1.0",
+                           [(number, ["pass"] * 50) for number in range(1, 31)])
+            write_pages_md(draft / names[1], "后半", "示例软件", "V1.0", [(31, ["pass"])])
+            with patch("build_docx_from_md.OfficeCli") as cli, self.assertRaisesRegex(ValueError, names[1]):
+                build_all(workdir, "示例软件", "V1.0", skip_preview=True)
+            cli.assert_not_called()
+            self.assertEqual({path.name for path in final.iterdir()}, {old.name})
+            self.assertEqual(old.read_text(encoding="utf-8"), "上一批")
+
+    def test_manual_adds_contents_at_start_with_field_updates(self) -> None:
+        """目录置于正文之前，导出前可更新标题和页码。"""
+        path = self.temp_dir / "manual.md"
+        path.write_text("# 示例软件\n\n## 一、使用方法\n\n内容。\n", encoding="utf-8")
+        cli = Mock()
+        cli.get.return_value = {"data": {"results": [{"path": "/body", "children": [
+            {"type": "paragraph", "path": "/body/p[1]", "style": "Heading1", "text": "示例软件"},
+            {"type": "paragraph", "path": "/body/p[2]", "format": {"style": "Heading2"}, "text": "一、使用方法"},
+        ]}]}}
+        with patch("build_docx_from_md.normalize_docx_theme_fonts"):
+            build_manual_docx(cli, path, self.temp_dir / "manual.docx", self.temp_dir, "示例软件", "V1.0")
+        commands = cli.run_batch.call_args.args[1]
+        self.assertNotIn("outlineLvl", commands[0]["props"])
+        self.assertEqual(commands[1]["props"]["outlineLvl"], "1")
+        self.assertEqual(commands[2]["index"], 0)
+        self.assertEqual(commands[2]["props"]["levels"], "2-2")
+        self.assertEqual(commands[3]["props"]["updateFields"], "true")
 
     def test_manual_local_image_becomes_placeholder(self) -> None:
         image = self.temp_dir / "test-officecli-builder-shot.png"

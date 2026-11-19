@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import re
 import unicodedata
 from pathlib import Path
 from typing import Any
 
 from common import (
     CODE_LINES_PER_PAGE,
+    CODE_MIN_LINES_PER_PAGE,
     CODE_MAX_COLUMNS,
     FRONTEND_EXTS,
+    confirmation_is_current,
     ensure_dir,
     is_source_candidate,
+    iter_source_files,
     read_json,
     read_text,
     rel,
@@ -69,11 +73,12 @@ def should_skip_file(path: Path) -> bool:
 
 
 def selected_line_estimate(item: dict[str, Any]) -> int:
+    """按源码折行后的非空排版行估算，文件路径只在清单中记录。"""
     try:
-        total = int(item.get("material_line_count") or item.get("line_count") or 0)
+        total = int(item.get("material_line_count", item.get("line_count", 0)))
     except (TypeError, ValueError):
         total = 0
-    return total + 1 if total > 0 else 0
+    return max(0, total)
 
 
 def available_pages_from_selection(selection_path: Path | None, lines_per_page: int) -> tuple[int, int, int]:
@@ -87,10 +92,6 @@ def available_pages_from_selection(selection_path: Path | None, lines_per_page: 
     unselected = sum(1 for item in items if isinstance(item, dict) and not item.get("selected") and selected_line_estimate(item) > 0)
     pages = (available_lines + lines_per_page - 1) // lines_per_page if available_lines else 0
     return available_lines, pages, unselected
-
-
-def marker_for(path: Path, project: Path) -> str:
-    return f"// File: {rel(path, project)}"
 
 
 def display_width(text: str) -> int:
@@ -129,9 +130,11 @@ def source_code_lines(text: str) -> list[str]:
 
 
 def material_code_lines(text: str, max_columns: int = MAX_CODE_COLUMNS) -> list[str]:
+    """生成用于鉴别材料的非空源码行。"""
     lines: list[str] = []
     for source_line in source_code_lines(text):
-        lines.extend(wrap_display_line(source_line, max_columns))
+        # 超长缩进可能折出纯空白段，这些段不占用正式材料的排版行。
+        lines.extend(segment for segment in wrap_display_line(source_line, max_columns) if segment.strip())
     return lines
 
 
@@ -170,6 +173,7 @@ def load_selected_files(project: Path, selection_path: Path | None) -> list[dict
 
 
 def collect_code_lines(project: Path, selection_path: Path | None) -> tuple[list[str], list[dict[str, Any]]]:
+    """读取已选源码并记录每个文件在材料中的位置。"""
     selected_items = load_selected_files(project, selection_path)
     all_lines: list[str] = []
     manifest_files: list[dict[str, Any]] = []
@@ -181,7 +185,7 @@ def collect_code_lines(project: Path, selection_path: Path | None) -> tuple[list
         except ValueError:
             raise SystemExit(f"Selected file is outside project: {path}")
         if should_skip_file(path):
-            continue
+            raise SystemExit(f"已选源码文件不存在、不可读取或不再符合候选条件：{path}")
         text = read_text(path)
         source_lines = text.splitlines()
         selected_source_lines = source_code_lines(text)
@@ -189,9 +193,7 @@ def collect_code_lines(project: Path, selection_path: Path | None) -> tuple[list
         if not selected_source_lines:
             continue
         start = len(all_lines) + 1
-        marker = marker_for(path, project)
-        marker_lines = wrap_display_line(marker)
-        all_lines.extend(marker_lines)
+        # 文件和行范围记录在提取清单内，不往鉴别材料的正文插入人工标记。
         all_lines.extend(selected_lines)
         end = len(all_lines)
         source_end_line = len(source_lines)
@@ -203,7 +205,7 @@ def collect_code_lines(project: Path, selection_path: Path | None) -> tuple[list
                 "selected_line_start": 1,
                 "selected_line_end": source_end_line,
                 "selected_line_count": len(selected_source_lines),
-                "material_line_count": len(marker_lines) + len(selected_lines),
+                "material_line_count": len(selected_lines),
                 "material_line_start": start,
                 "material_line_end": end,
             }
@@ -216,15 +218,23 @@ def paginate(lines: list[str], lines_per_page: int) -> list[list[str]]:
 
 
 def write_pages_md(path: Path, title: str, software_name: str, version: str, pages: list[tuple[int, list[str]]]) -> None:
+    """将各页源码写入 Markdown，并避免源码中的反引号提前结束代码块。"""
     chunks = [f"# {title}", "", f"软件名称：{software_name}", f"版本号：{version}", ""]
     for page_no, page_lines in pages:
-        chunks.extend([f"## 第 {page_no} 页", "", "```text"])
+        # 围栏必须长于该页正文中最长的连续反引号，才能保留原始源码。
+        longest_backticks = max(
+            (len(match.group()) for line in page_lines for match in re.finditer(r"`+", line)),
+            default=0,
+        )
+        fence = "`" * max(3, longest_backticks + 1)
+        chunks.extend([f"## 第 {page_no} 页", "", f"{fence}text"])
         chunks.extend(page_lines)
-        chunks.extend(["```", ""])
+        chunks.extend([fence, ""])
     path.write_text("\n".join(chunks), encoding="utf-8")
 
 
 def write_manifest_md(path: Path, manifest: dict[str, Any]) -> None:
+    """生成人工可核对的源码来源及排除理由清单。"""
     lines = [
         "# 代码提取清单",
         "",
@@ -255,10 +265,17 @@ def write_manifest_md(path: Path, manifest: dict[str, Any]) -> None:
             f"{item['material_line_count']} | "
             f"{item['material_line_start']}-{item['material_line_end']} |"
         )
+    if manifest.get("excluded_files"):
+        lines.extend(["", "## 经确认不属于申请软件的候选文件", ""])
+        for item in manifest["excluded_files"]:
+            lines.append(f"- `{item['path']}`：{item['reason']}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def extract(project: Path, out_dir: Path, software_name: str, version: str, lines_per_page: int, selection_path: Path | None) -> dict[str, Any]:
+    """根据确认的文件选择生成源码材料及可追溯清单。"""
+    if not CODE_MIN_LINES_PER_PAGE <= lines_per_page <= LINES_PER_PAGE:
+        raise ValueError(f"每页源码行数应在 {CODE_MIN_LINES_PER_PAGE}–{LINES_PER_PAGE} 之间")
     ensure_dir(out_dir)
     code_lines, files = collect_code_lines(project, selection_path)
     if not code_lines:
@@ -266,13 +283,54 @@ def extract(project: Path, out_dir: Path, software_name: str, version: str, line
 
     pages = paginate(code_lines, lines_per_page)
     total_pages = len(pages)
-    available_lines, available_pages, unselected_count = available_pages_from_selection(selection_path, lines_per_page)
-    if total_pages < SPLIT_THRESHOLD_PAGES and available_pages >= SPLIT_THRESHOLD_PAGES and unselected_count > 0:
-        raise SystemExit(
-            "STOP_FOR_USER\n"
-            f"NEXT_ACTION: 当前已选代码只有 {total_pages} 页，但候选源码足够补齐到 {SPLIT_THRESHOLD_PAGES} 页。"
-            "请在 草稿/代码文件选择.json 中继续选择补充文件，重新记录 code-selection 门禁后再抽取。"
-        )
+    available_lines, available_pages, _ = available_pages_from_selection(selection_path, lines_per_page)
+    excluded_files: list[dict[str, str]] = []
+    if total_pages < SPLIT_THRESHOLD_PAGES:
+        selection = read_json(selection_path) if selection_path is not None else {}
+        items = selection.get("files", []) if isinstance(selection, dict) else selection
+        listed_paths = {
+            (project / str(item["path"])).resolve()
+            for item in items
+            if isinstance(item, dict) and item.get("path")
+        }
+        # 截断清单或确认后新增的源码不能被默认为完整范围之外。
+        unlisted = [rel(path, project) for path in iter_source_files(project) if path.resolve() not in listed_paths]
+        if unlisted:
+            raise SystemExit(
+                "STOP_FOR_USER\n"
+                "NEXT_ACTION: 发现未列入源码候选清单的文件，请用 --max-files 0 重新生成完整候选清单并确认：\n"
+                + "\n".join(f"- {name}" for name in sorted(unlisted))
+            )
+        unselected = [item for item in items if isinstance(item, dict) and item.get("path") and not item.get("selected")]
+        prefix = "不属于申请软件："
+        missing_reasons = [
+            str(item["path"])
+            for item in unselected
+            if not str(item.get("model_reason") or "").strip().startswith(prefix)
+            or not str(item.get("model_reason") or "").strip()[len(prefix):].strip()
+        ]
+        # 不足 60 页须提交完整源码；候选清单含无关文件时，由用户确认排除依据。
+        if missing_reasons:
+            raise SystemExit(
+                "STOP_FOR_USER\n"
+                "NEXT_ACTION: 已选源码不足 60 页，请补选属于申请软件的全部源码；"
+                "不属于申请软件的候选文件请在 model_reason 中以“\u4e0d属于申请软件：具体原因”说明，"
+                "然后重新确认代码选择。待处理文件：\n"
+                + "\n".join(f"- {name}" for name in missing_reasons)
+            )
+        if unselected and (
+            not isinstance(selection, dict)
+            or not selection.get("user_confirmed")
+            or not confirmation_is_current(selection)
+        ):
+            raise SystemExit(
+                "STOP_FOR_USER\n"
+                "NEXT_ACTION: 请核对全部源码和排除理由，重新执行 confirm_stage.py --stage code-selection。"
+            )
+        excluded_files = [
+            {"path": str(item["path"]), "reason": str(item["model_reason"]).strip()}
+            for item in unselected
+        ]
     for stale_name in ("代码-前30页.md", "代码-后30页.md", "代码-全部.md"):
         (out_dir / stale_name).unlink(missing_ok=True)
     outputs: list[str] = []
@@ -293,9 +351,9 @@ def extract(project: Path, out_dir: Path, software_name: str, version: str, line
         outputs.append(all_path.name)
         mode = "all_under_60_pages"
     supplement_status = (
-        "候选源码可达到前30页/后30页要求"
-        if available_pages >= SPLIT_THRESHOLD_PAGES
-        else "候选源码不足60页，按全部代码材料生成"
+        "已选源码达到前30页/后30页要求"
+        if total_pages >= SPLIT_THRESHOLD_PAGES
+        else "已选源码不足60页，按全部代码材料生成；未选候选的排除理由已确认"
     )
 
     manifest = {
@@ -318,6 +376,7 @@ def extract(project: Path, out_dir: Path, software_name: str, version: str, line
         "selection_file": str(selection_path) if selection_path else None,
         "outputs": outputs,
         "files": files,
+        "excluded_files": excluded_files,
         "safe_software_filename": safe_filename(software_name),
     }
     write_json(out_dir / "代码提取清单.json", manifest)
@@ -326,13 +385,15 @@ def extract(project: Path, out_dir: Path, software_name: str, version: str, line
 
 
 def main() -> None:
+    """读取确认过的文件选择，生成源码分页和来源清单。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--analysis", help="Optional project analysis JSON; retained for workflow traceability")
     parser.add_argument("--software-name", required=True)
     parser.add_argument("--version", default="V1.0")
     parser.add_argument("--out-dir", default="软件著作权申请资料/草稿")
-    parser.add_argument("--lines-per-page", type=int, default=LINES_PER_PAGE)
+    parser.add_argument("--lines-per-page", type=int, default=LINES_PER_PAGE,
+                        choices=range(CODE_MIN_LINES_PER_PAGE, LINES_PER_PAGE + 1))
     parser.add_argument("--selection", help="Editable JSON file created by propose_code_selection.py")
     args = parser.parse_args()
 

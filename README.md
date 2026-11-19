@@ -132,7 +132,7 @@ officecli --version
 
 ### 可选能力
 
-- **Microsoft Word（Windows）**：代码段落连续写入 DOCX，由 Word 像普通文档一样根据页面空间自动换页；OfficeCLI 可调用 Word 取得最终真实页数。没有 Word 时仍可生成、做 OpenXML 校验和 OfficeCLI HTML 预览，但提交前必须在 Word 或 WPS 中人工复核分页。本项目统一使用 OfficeCLI。
+- **Microsoft Word（Windows）**：代码 DOCX 按草稿固定分页，OfficeCLI 可调用 Word 核对实际页数。提交前请在 Word 或 WPS 中更新操作手册目录，并对导出的 PDF 核对页眉、页脚、页码和正文行数。
 - **Node.js 18+、npm 和 `@playwright/cli@0.1.20`**：仅在选择 Playwright CLI 自动截图时需要。用户确认后可执行 `npm install -g @playwright/cli@0.1.20`；不会写入被分析项目的 `package.json`。
 - **Chrome**：Playwright CLI 自动截图优先使用本机已安装的 Chrome。只有 Chrome 不可用且用户同意时，才安装额外浏览器运行时。
 - **用户自行截图**：不使用自动截图时，可以把 PNG/JPG/JPEG/WebP 图片放到 `软件著作权申请资料/用户截图/`；也可以明确选择暂不截图，操作手册会保留可见的截图预留位置。
@@ -247,6 +247,26 @@ Copyright (c) 2026 Software Copyright Materials contributors
 - 不足 60 页时生成的全部代码材料
 
 申请人身份证明、权属证明、委托材料等其他文件，请按官网页面要求另行准备并上传。
+
+### 鉴别材料排版
+
+- 代码和操作手册均用 A4 纵向排版，页眉左侧标注与申请表一致的软件全称和版本号，右上角使用动态页码。页脚标注材料类别，具体文字为本项目的排版约定。[官网问答](https://www.ccopyright.com.cn/index.php?optionid=1087)
+- 源码前半部分从正文第 1 页开始，后半部分从第 31 页接续。操作手册从目录第 1 页开始，导出 PDF 前请更新整个目录。文档不超过 60 页时交存全文，超过 60 页时取前、后各连续 30 页。一般情况下，程序正文每页至少 50 行，文档正文每页至少 30 行。[官网所需文件](https://www.ccopyright.com.cn/index.php?optionid=1080)
+- 正式材料以登记系统当期签章承诺为准。申请人应据实准备文档和申请表内容，并确认代码来源。生成的草稿须在使用前核对其是否符合申请人能够如实签署的承诺。[中国版权保护中心公告](https://www.ccopyright.com.cn/index.php?optionid=999&method=view&optionid=999&auto_id=1524)
+
+### 校验操作手册 PDF
+
+在仓库根目录运行以下命令。完整版应为 Word 或 WPS 更新目录后导出的可提取文字的 PDF。
+
+```bash
+python -m pip install "pdfplumber>=0.11,<0.12"
+python software-copyright-materials/scripts/validate_manual_pdf.py --manual "完整版操作手册.pdf"
+```
+
+完整版超过 60 页时，命令会列出交存页段。按原顺序取前、后各连续 30 页，保持原页正文和图片，交存版页眉连续编号 1–60，再追加 `--submission "交存版操作手册.pdf"` 核对实际文件。对已由申请人确认的少于 30 行情形，可以追加 `--exception "完整版页码=具体理由"`，每页记录一次。
+
+报告按本仓库的 A4 版式区分页眉、页脚和正文，并列出逐页可提取正文行数和异常位置。校验失败返回非零退出码。使用自定义边距时，请核对行数报告。矢量图、批注和最终显示效果由申请人复核。
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=fokkyp%2Fsoftwarecopyright-skill&type=date&legend=bottom-right">

@@ -15,6 +15,8 @@ from common import (
     CODE_FONT_NAME,
     CODE_FONT_SIZE,
     CODE_LINE_SPACING,
+    CODE_LINES_PER_PAGE,
+    CODE_MIN_LINES_PER_PAGE,
     confirmation_is_current,
     draft_completeness_issues,
     draft_snapshot,
@@ -119,31 +121,33 @@ def confirmation_issues(workdir: Path) -> list[str]:
 
 
 def parse_code_pages(md_path: Path) -> list[tuple[int, list[str]]]:
+    """读取代码草稿，保留围栏内与 Markdown 标题相似的源码行。"""
     pages: list[tuple[int, list[str]]] = []
     current_no: int | None = None
     current_lines: list[str] = []
-    in_fence = False
+    fence = ""
     for raw in md_path.read_text(encoding="utf-8").splitlines():
-        page_match = re.match(r"^##\s+第\s*(\d+)\s*页", raw.strip())
+        if current_no is not None and fence:
+            if raw == fence:
+                pages.append((current_no, current_lines))
+                current_no, current_lines, fence = None, [], ""
+            else:
+                current_lines.append(raw)
+            continue
+        page_match = re.fullmatch(r"##\s+第\s*(\d+)\s*页", raw.strip())
         if page_match:
             if current_no is not None:
-                pages.append((current_no, current_lines))
+                raise ValueError(f"代码草稿第 {current_no} 页缺少源码围栏：{md_path}")
             current_no = int(page_match.group(1))
-            current_lines = []
-            in_fence = False
-            continue
-        if raw.strip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if current_no is not None and in_fence:
-            current_lines.append(raw)
+        elif current_no is not None and (opener := re.fullmatch(r"(`{3,})text", raw)):
+            fence = opener[1]
     if current_no is not None:
-        pages.append((current_no, current_lines))
+        raise ValueError(f"代码草稿第 {current_no} 页缺少完整源码围栏：{md_path}")
     return pages
 
 
 def header_commands(software_name: str, version: str) -> list[dict[str, Any]]:
-    """Create a left title and right page-number region in the default header."""
+    """在页眉左侧放软件名称和版本号，右侧使用动态页码。"""
     header_path = "/header[1]/p[1]"
     return [
         {"command": "add", "parent": "/", "type": "header", "props": {
@@ -161,6 +165,7 @@ def header_commands(software_name: str, version: str) -> list[dict[str, Any]]:
 
 
 def document_commands(software_name: str, version: str, *, code_mode: bool, page_start: int = 1) -> list[dict[str, Any]]:
+    """为两类鉴别材料统一配置 A4、页眉、页脚和起始页码。"""
     margin = "1.8cm" if code_mode else "2.5cm"
     default_size = CODE_FONT_SIZE if code_mode else "10.5pt"
     commands: list[dict[str, Any]] = [
@@ -175,6 +180,10 @@ def document_commands(software_name: str, version: str, *, code_mode: bool, page
             "marginHeader": "0.9cm", "marginFooter": "0.9cm", "pageStart": str(page_start)}},
     ]
     commands.extend(header_commands(software_name, version))
+    # 官网问答未指定页脚文字，材料类别便于区分两份文件，页码仍留在右上角。
+    commands.append({"command": "add", "parent": "/", "type": "footer", "props": {
+        "type": "default", "text": "源程序鉴别材料" if code_mode else "文档鉴别材料",
+        "align": "center", "font": "SimSun", "size": "9pt", "color": "#000000"}})
     return commands
 
 
@@ -264,21 +273,46 @@ def normalize_docx_theme_fonts(cli: OfficeCli, output: Path) -> None:
 
 
 def code_paragraph_commands(pages: list[tuple[int, list[str]]]) -> list[dict[str, Any]]:
+    """在每个源码分页的首个段落设置分页，避免排版时重排截取边界。"""
     commands: list[dict[str, Any]] = []
     for _, lines in pages:
-        for line in lines:
-            commands.append({"command": "add", "parent": "/body", "type": "paragraph", "props": {
-                "text": line if line else " ", "font": CODE_FONT_NAME, "font.ea": "SimSun",
+        for index, line in enumerate(lines):
+            props = {
+                "text": line, "font": CODE_FONT_NAME, "font.ea": "SimSun",
                 "size": CODE_FONT_SIZE, "color": "#000000", "spaceBefore": "0pt", "spaceAfter": "0pt",
                 "lineSpacing": CODE_LINE_SPACING, "lineRule": "exact",
-                "widowControl": "false", "wordWrap": "false"}})
+                "widowControl": "false", "wordWrap": "false",
+            }
+            if index == 0 and commands:
+                props["pageBreakBefore"] = "true"
+            commands.append({"command": "add", "parent": "/body", "type": "paragraph", "props": props})
     return commands
 
 
-def build_code_docx(cli: OfficeCli, md_path: Path, out_path: Path, software_name: str, version: str) -> int:
-    pages = parse_code_pages(md_path)
-    if not pages:
-        raise ValueError(f"代码草稿没有可识别分页：{md_path}")
+def validate_code_pages(pages: list[tuple[int, list[str]]], draft_name: str) -> None:
+    """用实际写入的正文校验页码、行数下限和页面容量。"""
+    front = draft_name == "代码-前30页.md"
+    back = draft_name == "代码-后30页.md"
+    start = 31 if back else 1
+    if not pages or ((front or back) and len(pages) != 30):
+        raise ValueError(f"{draft_name} 的源码分页数量不符合交存模式")
+    for index, (page_no, lines) in enumerate(pages):
+        if page_no != start + index:
+            raise ValueError(f"{draft_name} 页码不连续，应为第 {start + index} 页")
+        # 逐页检查实际传给 OfficeCLI 的非空源码行。
+        source_lines = sum(bool(line.strip()) for line in lines)
+        last = index == len(pages) - 1 and not front
+        minimum = 1 if last else CODE_MIN_LINES_PER_PAGE
+        if source_lines < minimum or source_lines != len(lines) or len(lines) > CODE_LINES_PER_PAGE:
+            raise ValueError(
+                f"{draft_name} 第 {page_no} 页有 {source_lines} 行源程序、{len(lines)} 个排版行。"
+                f"请重新抽取，普通页至少 {CODE_MIN_LINES_PER_PAGE} 行源程序，每页最多 {CODE_LINES_PER_PAGE} 个排版行。"
+            )
+
+
+def build_code_docx(cli: OfficeCli, pages: list[tuple[int, list[str]]], out_path: Path,
+                    software_name: str, version: str) -> int:
+    """把已校验的源码分页转换为 DOCX 并核对正文段落数。"""
     commands = document_commands(software_name, version, code_mode=True, page_start=pages[0][0])
     commands.extend(code_paragraph_commands(pages))
     expected_paragraphs = sum(len(lines) for _, lines in pages)
@@ -402,6 +436,7 @@ def body_children(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def manual_format_commands(children: list[dict[str, Any]], images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """统一手册正文版式，标记目录需要索引的章节。"""
     image_by_placeholder = {item["placeholder"]: item for item in images}
     commands: list[dict[str, Any]] = []
     for child in children:
@@ -422,6 +457,10 @@ def manual_format_commands(children: list[dict[str, Any]], images: list[dict[str
             "spaceAfter": "6pt", "lineSpacing": "1.5x", "widowControl": "true"}
         if style.lower().startswith("heading"):
             props.update({"font": "SimHei", "font.ea": "SimHei", "keepNext": "true"})
+            # OfficeCLI 导入 Markdown 会引用 Heading2，却不一定创建样式定义。
+            # 显式标注二级大纲，确保 Word 更新目录时能识别该段落。
+            if style.lower().replace(" ", "") == "heading2":
+                props["outlineLvl"] = "1"
         elif fmt.get("listStyle"):
             props.update({"size": "10.5pt", "align": "left"})
         elif text.startswith("【截图") or text.startswith("【远程图片"):
@@ -441,6 +480,7 @@ def build_manual_docx(
     version: str,
     screenshot_paths: list[Path | None] | None = None,
 ) -> dict[str, int]:
+    """生成以目录起页并按正文章节更新目录字段的操作手册。"""
     prepared: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -456,7 +496,14 @@ def build_manual_docx(
         commands.append({"command": "add", "parent": "/", "type": "markdown", "props": {"src": str(prepared.resolve())}})
         cli.create(out_path, commands)
         children = body_children(cli.get(out_path, "/body"))
-        cli.run_batch(out_path, manual_format_commands(children, images))
+        format_commands = manual_format_commands(children, images)
+        # 一级标题是手册名称，目录只收录实际的二级章节。
+        format_commands.extend([
+            {"command": "add", "parent": "/body", "type": "toc", "index": 0,
+             "props": {"levels": "2-2", "title": "目录", "hyperlinks": "true"}},
+            {"command": "set", "path": "/settings", "props": {"updateFields": "true"}},
+        ])
+        cli.run_batch(out_path, format_commands)
         normalize_docx_theme_fonts(cli, out_path)
         return {
             "manifest_images": manifest_image_count,
@@ -473,6 +520,7 @@ def build_manual_docx(
 
 def docx_checks(cli: OfficeCli, outputs: list[Path], estimated_pages: dict[Path, int], preview_dir: Path,
                 render_preview: bool = True) -> list[str]:
+    """检查 DOCX 结构，并用 OfficeCLI 能取得的页数预检源码分页。"""
     notes: list[str] = []
     if render_preview:
         ensure_dir(preview_dir)
@@ -493,25 +541,17 @@ def docx_checks(cli: OfficeCli, outputs: list[Path], estimated_pages: dict[Path,
         if estimated is not None:
             if pages is None:
                 notes.append(
-                    f"- `{output.name}`：当前环境无法取得 Word 原生页数；草稿按 {estimated} 页估算，"
-                    "提交前需在 Word/WPS 中复核自动分页结果。"
-                )
-            elif int(pages) != estimated and estimated == 30 and any(
-                marker in output.name for marker in ("(前30页)", "(后30页)")
-            ):
-                raise OfficeCliError(
-                    f"{output.name} 经 Word 自动分页后为 {pages} 页，不是要求的 30 页。"
-                    "请根据生成报告重新校准代码选材量后再生成，不能把页数不符的文档作为正式资料。"
+                    f"- `{output.name}`：OfficeCLI 未返回页数，草稿共 {estimated} 页。"
+                    "提交前需在 Word/WPS 中复核代码页数、页码和行数。"
                 )
             elif int(pages) != estimated:
-                notes.append(
-                    f"- `{output.name}`：Word 自动分页为 {pages} 页，草稿选材估算为 {estimated} 页；"
-                    "文档未插入人工分页符。"
+                raise OfficeCliError(
+                    f"{output.name} 的 OfficeCLI 页数为 {pages}，预计 {estimated} 页。"
+                    "请用 Word 或 WPS 检查源码段落是否跨页。"
                 )
             else:
                 notes.append(
-                    f"- `{output.name}`：Word 自动分页为 {pages} 页，与草稿选材估算一致；"
-                    "文档未插入人工分页符。"
+                    f"- `{output.name}`：OfficeCLI 页数为 {pages}，与源码草稿一致。请复核最终 PDF。"
                 )
         if render_preview:
             preview = preview_dir / f"{output.stem}.png"
@@ -528,6 +568,7 @@ def docx_checks(cli: OfficeCli, outputs: list[Path], estimated_pages: dict[Path,
 
 def build_all(workdir: Path, software_name: str, version: str, skip_preview: bool,
               allow_untested_officecli: bool = False) -> dict[str, Any]:
+    """检查全套源码草稿，再生成申请表和鉴别材料。"""
     workdir = ensure_dir(workdir)
     draft_dir = workdir / "草稿"
     final_dir = ensure_dir(workdir / "正式资料")
@@ -539,6 +580,19 @@ def build_all(workdir: Path, software_name: str, version: str, skip_preview: boo
     outputs: list[Path] = []
     warnings: list[str] = []
     estimated_pages: dict[Path, int] = {}
+    code_spec_map = {
+        "代码-前30页.md": f"{safe_name}-代码(前30页).docx",
+        "代码-后30页.md": f"{safe_name}-代码(后30页).docx",
+        "代码-全部.md": f"{safe_name}-代码(全部).docx",
+    }
+    code_manifest = read_json_if_exists(draft_dir / "代码提取清单.json")
+    code_drafts: dict[str, list[tuple[int, list[str]]]] = {}
+    # 后半部分草稿也须先通过校验，避免失败时混留不同批次的正式文件。
+    for md_name in code_manifest.get("outputs", []):
+        if isinstance(md_name, str) and md_name in code_spec_map:
+            pages = parse_code_pages(draft_dir / md_name)
+            validate_code_pages(pages, md_name)
+            code_drafts[md_name] = pages
     cli = OfficeCli(require_tested_version=not allow_untested_officecli)
     if app_name and app_name != software_name:
         warnings.append(f"命令参数软件名称为 {software_name}，正式资料已按申请表信息软件名称 {app_name} 生成")
@@ -570,22 +624,12 @@ def build_all(workdir: Path, software_name: str, version: str, skip_preview: boo
     if app_txt:
         outputs.append(app_txt)
     warnings.extend(app_warnings)
-    code_spec_map = {
-        "代码-前30页.md": f"{safe_name}-代码(前30页).docx",
-        "代码-后30页.md": f"{safe_name}-代码(后30页).docx",
-        "代码-全部.md": f"{safe_name}-代码(全部).docx",
-    }
-    code_manifest = read_json_if_exists(draft_dir / "代码提取清单.json")
-    declared_code_drafts = [
-        str(name) for name in code_manifest.get("outputs", []) if str(name) in code_spec_map
-    ]
     for md_name, docx_name in code_spec_map.items():
-        if md_name not in declared_code_drafts:
+        if md_name not in code_drafts:
             (final_dir / docx_name).unlink(missing_ok=True)
-    for md_name in declared_code_drafts:
-        md_path = draft_dir / md_name
+    for md_name, pages in code_drafts.items():
         out_path = final_dir / code_spec_map[md_name]
-        estimated_pages[out_path] = build_code_docx(cli, md_path, out_path, final_software_name, final_version)
+        estimated_pages[out_path] = build_code_docx(cli, pages, out_path, final_software_name, final_version)
         outputs.append(out_path)
     manual_md = draft_dir / "操作手册.md"
     if manual_md.exists():
@@ -623,6 +667,7 @@ def build_all(workdir: Path, software_name: str, version: str, skip_preview: boo
             if renamed_manual:
                 renamed_manual.unlink(missing_ok=True)
         outputs.append(manual_out)
+        warnings.append("请在 Word/WPS 更新整个目录并导出 PDF，再用 validate_manual_pdf.py 校验目录、正文行数和交存页段")
     else:
         warnings.append("缺少草稿/操作手册.md")
     docx_outputs = [path for path in outputs if path.suffix.lower() == ".docx"]
